@@ -1,0 +1,115 @@
+name: Deploy Mobile CahierBi
+
+# Chaque push sur main : tests, APK Android signé + PWA, envoi sur le VPS,
+# puis le backend annonce la nouvelle version (MOBILE_LATEST_VERSION) aux applications installées.
+# Les téléphones ne proposent la mise à jour que si `version:` du pubspec.yaml a été montée.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Mise à jour obligatoire (MOBILE_MIN_VERSION = cette version)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-mobile
+  cancel-in-progress: false
+
+env:
+  API_URL: https://backendcahierbi.niangdev.com/api
+  WEB_ROOT: /var/www/cahierbi-pwa
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.29.2"
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test
+
+      - id: vars
+        run: |
+          echo "version=$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')" >> "$GITHUB_OUTPUT"
+
+      # Toujours la même clé : un APK signé avec une autre clé ne peut pas s'installer par-dessus
+      - name: Clé de signature Android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          [ -n "$KEYSTORE_BASE64" ] || { echo "Secret ANDROID_KEYSTORE_BASE64 manquant"; exit 1; }
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/upload.jks
+          {
+            echo "storeFile=upload.jks"
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+
+      - run: flutter build apk --release --dart-define=API_URL=${{ env.API_URL }}
+      # APP_VERSION : la PWA compare sa version à celle du serveur pour se recharger
+      - run: flutter build web --release --dart-define=API_URL=${{ env.API_URL }} --dart-define=APP_VERSION=${{ steps.vars.outputs.version }}
+
+      # L'APK est servi avec la PWA : https://app-cahierbi.niangdev.com/cahierbi.apk
+      - run: cp build/app/outputs/flutter-apk/app-release.apk build/web/cahierbi.apk
+
+      - name: Envoi sur le VPS
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          rsync -az --delete -e "ssh -i ~/.ssh/id_deploy" build/web/ "$TARGET:${{ env.WEB_ROOT }}/"
+
+      # Après l'envoi de l'APK : le lien annoncé pointe toujours vers la bonne version
+      - name: Annonce de la version
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/cahierbi
+            # Réécrit le contenu du .env sur place : il suffit que deploy puisse écrire dans le fichier
+            # (sed -i créerait un fichier temporaire dans backend/, qui appartient à root)
+            set_env() {
+              tmp=$(mktemp)
+              grep -v "^$1=" backend/.env > "$tmp" || true
+              echo "$1=$2" >> "$tmp"
+              cat "$tmp" > backend/.env
+              rm -f "$tmp"
+            }
+            set_env MOBILE_LATEST_VERSION "${{ steps.vars.outputs.version }}"
+            if [ "${{ inputs.force }}" = "true" ]; then
+              set_env MOBILE_MIN_VERSION "${{ steps.vars.outputs.version }}"
+            fi
+            # Recréé seulement si le .env a changé (configuration figée au démarrage)
+            docker compose up -d backend
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              curl -sf http://localhost:8087/up > /dev/null && exit 0
+              sleep 3
+            done
+            echo "Healthcheck failed" && exit 1
